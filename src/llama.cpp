@@ -84,7 +84,8 @@ int64_t llama_time_us(void) {
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
-static int llama_model_load(const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
+template<typename LoaderFactory>
+static int llama_model_load_impl(llama_model & model, llama_model_params & params, LoaderFactory && create_loader) {
     // loading time will be recalculated after the first eval, so
     // we take page faults deferred by mmap() into consideration
     model.t_load_us = 0;
@@ -93,7 +94,7 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     model.t_start_us = tm.t_start_us;
 
     try {
-        llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+        auto ml = create_loader();
 
         ml.print_info();
 
@@ -134,10 +135,20 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     return 0;
 }
 
-static struct llama_model * llama_model_load_from_file_impl(
-        const std::string & path_model,
-        std::vector<std::string> & splits,
-        struct llama_model_params params) {
+static int llama_model_load(const std::string & fname, std::vector<std::string> & splits, llama_model & model, llama_model_params & params) {
+    return llama_model_load_impl(model, params, [&]() {
+        return llama_model_loader(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
+}
+
+static int llama_model_load_from_buffer(const void * buffer, size_t buffer_size, llama_model & model, llama_model_params & params) {
+    return llama_model_load_impl(model, params, [&]() {
+        return llama_model_loader(buffer, buffer_size, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
+}
+
+template<typename LoaderFactory>
+static struct llama_model * llama_model_load_unified_impl(struct llama_model_params params, LoaderFactory && create_loader) {
     ggml_time_init();
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
@@ -180,7 +191,7 @@ static struct llama_model * llama_model_load_from_file_impl(
                     // skip CPU backends since they are handled separately
                     break;
 
-                case GGML_BACKEND_DEVICE_TYPE_GPU:
+                case GGML_BACKEND_DEVICE_TYPE_GPU: {
                     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                     if (ggml_backend_reg_name(reg) == std::string("RPC")) {
                         rpc_servers.push_back(dev);
@@ -188,6 +199,7 @@ static struct llama_model * llama_model_load_from_file_impl(
                         model->devices.push_back(dev);
                     }
                     break;
+                }
             }
         }
         // add RPC servers at the front of the list
@@ -218,7 +230,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
     }
 
-    const int status = llama_model_load(path_model, splits, *model, params);
+    const int status = llama_model_load_impl(*model, params, create_loader);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -232,6 +244,24 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     return model;
+}
+
+static struct llama_model * llama_model_load_from_buffer_impl(
+        const void * buffer,
+        size_t buffer_size,
+        struct llama_model_params params) {
+    return llama_model_load_unified_impl(params, [&]() {
+        return llama_model_loader(buffer, buffer_size, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
+}
+
+static struct llama_model * llama_model_load_from_file_impl(
+        const char * path_model,
+        std::vector<std::string> & splits,
+        struct llama_model_params params) {
+    return llama_model_load_unified_impl(params, [&]() {
+        return llama_model_loader(path_model, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
 }
 
 // deprecated
@@ -260,7 +290,30 @@ struct llama_model * llama_model_load_from_splits(
     for (size_t i = 0; i < n_paths; ++i) {
         splits.push_back(paths[i]);
     }
-    return llama_model_load_from_file_impl(splits.front(), splits, params);
+    return llama_model_load_from_file_impl(splits.front().c_str(), splits, params);
+}
+
+struct llama_model * llama_model_load_from_buffer(
+        const void * buffer,
+        size_t buffer_size,
+        struct llama_model_params params) {
+    return llama_model_load_from_buffer_impl(buffer, buffer_size, params);
+}
+
+struct llama_model * llama_model_load_from_file_handle(
+        FILE * file,
+        struct llama_model_params params) {
+    return llama_model_load_unified_impl(params, [&]() {
+        return llama_model_loader(file, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
+}
+
+struct llama_model * llama_model_load_from_io(
+        struct gguf_io_functions io_funcs,
+        struct llama_model_params params) {
+    return llama_model_load_unified_impl(params, [&]() {
+        return llama_model_loader(io_funcs, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
+    });
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

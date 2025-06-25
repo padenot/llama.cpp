@@ -76,9 +76,19 @@ extern "C" {
         struct ggml_context ** ctx;
     };
 
+    // IO function pointers for custom IO implementations
+    struct gguf_io_functions {
+        void * user_data;
+        int (*read)(void * user_data, void * buffer, size_t size);
+        int (*seek)(void * user_data, size_t position);
+        size_t (*tell)(void * user_data);
+    };
+
     GGML_API struct gguf_context * gguf_init_empty(void);
     GGML_API struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_params params);
-    //GGML_API struct gguf_context * gguf_init_from_buffer(..);
+    GGML_API struct gguf_context * gguf_init_from_buffer(const void * buffer, size_t buffer_size, struct gguf_init_params params);
+    GGML_API struct gguf_context * gguf_init_from_file_handle(FILE * file, struct gguf_init_params params);
+    GGML_API struct gguf_context * gguf_init_from_io(struct gguf_io_functions io_funcs, struct gguf_init_params params);
 
     GGML_API void gguf_free(struct gguf_context * ctx);
 

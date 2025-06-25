@@ -216,14 +216,14 @@ struct gguf_context {
     void * data = nullptr;
 };
 
-struct gguf_reader {
-    FILE * file;
+struct gguf_io_reader {
+    gguf_io_functions io;
 
-    gguf_reader(FILE * file) : file(file) {}
+    gguf_io_reader(struct gguf_io_functions io_funcs) : io(io_funcs) {}
 
     template <typename T>
     bool read(T & dst) const {
-        return fread(&dst, 1, sizeof(dst), file) == sizeof(dst);
+        return io.read(io.user_data, &dst, sizeof(T)) == 0;
     }
 
     template <typename T>
@@ -278,20 +278,102 @@ struct gguf_reader {
             return false;
         }
         dst.resize(size);
-        return fread(dst.data(), 1, dst.length(), file) == dst.length();
+        return io.read(io.user_data, dst.data(), size) == 0;
     }
 
     bool read(void * dst, const size_t size) const {
-        return fread(dst, 1, size, file) == size;
+        return io.read(io.user_data, dst, size) == 0;
+    }
+
+    bool seek(size_t position) {
+        return io.seek(io.user_data, position) == 0;
+    }
+
+    size_t tell() const {
+        return io.tell(io.user_data);
     }
 };
+
+struct file_io_state {
+    FILE* file;
+    file_io_state(FILE* f) : file(f) {}
+};
+
+static int file_io_read(void* user_data, void* buffer, size_t size) {
+    file_io_state* state = static_cast<file_io_state*>(user_data);
+    size_t bytes_read = fread(buffer, 1, size, state->file);
+    return (bytes_read == size) ? 0 : -1;
+}
+
+static int file_io_seek(void* user_data, size_t position) {
+    file_io_state* state = static_cast<file_io_state*>(user_data);
+    return fseek(state->file, position, SEEK_SET);
+}
+
+static size_t file_io_tell(void* user_data) {
+    file_io_state* state = static_cast<file_io_state*>(user_data);
+    return ftell(state->file);
+}
+
+struct buffer_io_state {
+    const uint8_t* buffer;
+    size_t buffer_size;
+    size_t offset;
+    buffer_io_state(const void* buf, size_t size)
+        : buffer(static_cast<const uint8_t*>(buf)), buffer_size(size), offset(0) {}
+};
+
+static int buffer_io_read(void* user_data, void* buffer, size_t size) {
+    buffer_io_state* state = static_cast<buffer_io_state*>(user_data);
+    if (state->offset + size > state->buffer_size) {
+        return -1;
+    }
+    memcpy(buffer, state->buffer + state->offset, size);
+    state->offset += size;
+    return 0;
+}
+
+static int buffer_io_seek(void* user_data, size_t position) {
+    buffer_io_state* state = static_cast<buffer_io_state*>(user_data);
+    if (position > state->buffer_size) {
+        return -1;
+    }
+    state->offset = position;
+    return 0;
+}
+
+static size_t buffer_io_tell(void* user_data) {
+    buffer_io_state* state = static_cast<buffer_io_state*>(user_data);
+    return state->offset;
+}
+
+// Helper functions to create IO functions for each method
+static gguf_io_functions create_file_io_functions(FILE* file, file_io_state* state) {
+    *state = file_io_state(file);
+    return {
+        .user_data = state,
+        .read = file_io_read,
+        .seek = file_io_seek,
+        .tell = file_io_tell
+    };
+}
+
+static gguf_io_functions create_buffer_io_functions(const void* buffer, size_t buffer_size, buffer_io_state* state) {
+    *state = buffer_io_state(buffer, buffer_size);
+    return {
+        .user_data = state,
+        .read = buffer_io_read,
+        .seek = buffer_io_seek,
+        .tell = buffer_io_tell
+    };
+}
 
 struct gguf_context * gguf_init_empty(void) {
     return new gguf_context;
 }
 
-template<typename T>
-bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct gguf_kv> & kv, const std::string & key, const bool is_array, const size_t n) {
+template<typename T, typename Reader>
+bool gguf_read_emplace_helper_template(const Reader & gr, std::vector<struct gguf_kv> & kv, const std::string & key, const bool is_array, const size_t n) {
     if (is_array) {
         std::vector<T> value;
         try {
@@ -316,8 +398,15 @@ bool gguf_read_emplace_helper(const struct gguf_reader & gr, std::vector<struct 
     return true;
 }
 
-struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_params params) {
-    const struct gguf_reader gr(file);
+// Now using only the unified IO reader template specialization
+template<typename T>
+bool gguf_read_emplace_helper(const struct gguf_io_reader & gr, std::vector<struct gguf_kv> & kv, const std::string & key, const bool is_array, const size_t n) {
+    return gguf_read_emplace_helper_template<T>(gr, kv, key, is_array, n);
+}
+
+
+// Unified implementation using IO functions
+static struct gguf_context * gguf_init_impl(gguf_io_reader & gr, struct gguf_init_params params) {
     struct gguf_context * ctx = new gguf_context;
 
     bool ok = true;
@@ -426,6 +515,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
                 GGML_LOG_ERROR("%s: encountered bad_alloc error while reading key %" PRIi64 "\n", __func__, i);
                 ok = false;
             }
+
             for (size_t j = 0; ok && j < ctx->kv.size(); ++j) {
                 if (key == ctx->kv[j].key) {
                     GGML_LOG_ERROR("%s: duplicate key '%s' for tensors %zu and %" PRIi64 " \n", __func__, key.c_str(), j, i);
@@ -486,8 +576,10 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     }
 
     // read the tensor info
+    ctx->info.resize(n_tensors);
+
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
-        struct gguf_tensor_info info;
+        gguf_tensor_info & info = ctx->info[i];
 
         // tensor name
         {
@@ -598,9 +690,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
 
         // tensor data offset within buffer
         ok = ok && gr.read(info.offset);
-
-        ctx->info.push_back(info);
-    }
+        }
 
     if (!ok) {
         GGML_LOG_ERROR("%s: failed to read tensor info\n", __func__);
@@ -610,14 +700,14 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
-    if (fseek(file, GGML_PAD(ftell(file), ctx->alignment), SEEK_SET) != 0) {
+    if (!gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         gguf_free(ctx);
         return nullptr;
     }
 
     // store the current file offset - this is where the data section starts
-    ctx->offset = ftell(file);
+    ctx->offset = gr.tell();
 
     // compute the total size of the data section, taking into account the alignment
     {
@@ -724,7 +814,7 @@ struct gguf_context * gguf_init_from_file_impl(FILE * file, struct gguf_init_par
             return nullptr;
         }
 
-        ggml_set_no_alloc(ctx_data, params.no_alloc);
+        ggml_set_no_alloc(ctx_data, false);
     }
 
     return ctx;
@@ -738,9 +828,48 @@ struct gguf_context * gguf_init_from_file(const char * fname, struct gguf_init_p
         return nullptr;
     }
 
-    struct gguf_context * result = gguf_init_from_file_impl(file, params);
+    file_io_state state(file);
+    gguf_io_functions io_funcs = create_file_io_functions(file, &state);
+
+    struct gguf_context * result = gguf_init_from_io(io_funcs, params);
     fclose(file);
     return result;
+}
+
+
+struct gguf_context * gguf_init_from_buffer(const void * buffer, size_t buffer_size, struct gguf_init_params params) {
+    if (buffer == nullptr || buffer_size == 0) {
+        GGML_LOG_ERROR("%s: invalid buffer parameters\n", __func__);
+        return nullptr;
+    }
+
+    buffer_io_state state(buffer, buffer_size);
+    gguf_io_functions io_funcs = create_buffer_io_functions(buffer, buffer_size, &state);
+
+    return gguf_init_from_io(io_funcs, params);
+}
+
+struct gguf_context * gguf_init_from_file_handle(FILE * file, struct gguf_init_params params) {
+    if (file == nullptr) {
+        GGML_LOG_ERROR("%s: invalid file handle\n", __func__);
+        return nullptr;
+    }
+
+    // Note: The caller is responsible for closing the file handle
+    file_io_state state(file);
+    gguf_io_functions io_funcs = create_file_io_functions(file, &state);
+
+    return gguf_init_from_io(io_funcs, params);
+}
+
+struct gguf_context * gguf_init_from_io(struct gguf_io_functions io_funcs, struct gguf_init_params params) {
+    if (io_funcs.read == nullptr || io_funcs.seek == nullptr || io_funcs.tell == nullptr) {
+        GGML_LOG_ERROR("%s: invalid IO functions\n", __func__);
+        return nullptr;
+    }
+
+    struct gguf_io_reader gr(io_funcs);
+    return gguf_init_impl(gr, params);
 }
 
 void gguf_free(struct gguf_context * ctx) {

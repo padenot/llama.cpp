@@ -466,6 +466,62 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
 
+void llama_model_loader::init_common(bool check_tensors,
+                                     const llama_model_kv_override * param_overrides_p,
+                                     const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
+    // Process parameter overrides
+    if (param_overrides_p != nullptr) {
+        for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
+            kv_overrides.insert({std::string(p->key), *p});
+        }
+    }
+
+    tensor_buft_overrides = param_tensor_buft_overrides_p;
+    this->check_tensors = check_tensors;
+
+    // Extract architecture information
+    get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+    llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+}
+
+template<typename... Args>
+void llama_model_loader::process_tensors_with_weights(struct ggml_context * ctx, Args&&... args) {
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+        std::string tensor_name = std::string(cur->name);
+        // make sure there are no duplicated tensor names
+        if (weights_map.find(tensor_name) != weights_map.end()) {
+            throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+        }
+        n_elements += ggml_nelements(cur);
+        n_bytes    += ggml_nbytes(cur);
+        weights_map.emplace(tensor_name, llama_tensor_weight(std::forward<Args>(args)..., meta.get(), cur));
+    }
+}
+
+void llama_model_loader::finalize_simple_loading(const char * load_type, size_t size_info) {
+    // Set defaults for non-file-based loading (doesn't support splits)
+    ftype = LLAMA_FTYPE_GUESSED;
+    fver = GGUF_FILE_VERSION_V3;
+
+    // Validate file version
+    if (fver != GGUF_FILE_VERSION_V1 && fver != GGUF_FILE_VERSION_V2 && fver != GGUF_FILE_VERSION_V3) {
+        throw std::runtime_error(format("invalid GGUF version: %d", fver));
+    }
+
+    n_tensors = weights_map.size();
+
+    // Log based on whether size info is provided
+    if (size_info > 0) {
+        LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (%zu MB)\n",
+                       __func__, n_kv, n_tensors, load_type, size_info / (1024 * 1024));
+    } else {
+        LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s\n",
+                       __func__, n_kv, n_tensors, load_type);
+    }
+
+    this->use_mmap = false;
+}
+
 llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
@@ -477,14 +533,6 @@ llama_model_loader::llama_model_loader(
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
     }
-
-    if (param_overrides_p != nullptr) {
-        for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
-            kv_overrides.insert({std::string(p->key), *p});
-        }
-    }
-
-    tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
@@ -498,8 +546,7 @@ llama_model_loader::llama_model_loader(
         throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
     }
 
-    get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-    llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+    init_common(check_tensors, param_overrides_p, param_tensor_buft_overrides_p);
 
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
@@ -713,7 +760,100 @@ llama_model_loader::llama_model_loader(
     }
 
     this->use_mmap = use_mmap;
-    this->check_tensors = check_tensors;
+}
+
+llama_model_loader::llama_model_loader(
+        const void * buffer,
+        size_t buffer_size,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
+    // Tracing not implemented for buffer-based loading
+
+    this->buffer_data = buffer;
+    this->buffer_size = buffer_size;
+
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+
+    meta.reset(gguf_init_from_buffer(buffer, buffer_size, params));
+    if (!meta) {
+        throw std::runtime_error(format("%s: failed to load model from buffer", __func__));
+    }
+
+    init_common(check_tensors, param_overrides_p, param_tensor_buft_overrides_p);
+
+    contexts.emplace_back(ctx);
+
+    // Process tensors and create weights
+    process_tensors_with_weights(ctx, buffer_size, 0);
+
+    finalize_simple_loading("buffer", buffer_size);
+}
+
+llama_model_loader::llama_model_loader(
+        FILE * file,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
+    this->file_handle = file;
+
+    // Get file size
+    long current_pos = ftell(file);
+    fseek(file, 0, SEEK_END);
+    size_t file_size = ftell(file);
+    fseek(file, current_pos, SEEK_SET);
+
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+
+    meta.reset(gguf_init_from_file_handle(file, params));
+    if (!meta) {
+        throw std::runtime_error(format("%s: failed to load model from file handle", __func__));
+    }
+
+    init_common(check_tensors, param_overrides_p, param_tensor_buft_overrides_p);
+
+    contexts.emplace_back(ctx);
+
+    // Process tensors and create weights
+    process_tensors_with_weights(ctx, file_size, 0);
+
+    finalize_simple_loading("file handle", file_size);
+}
+
+llama_model_loader::llama_model_loader(
+        struct gguf_io_functions io_funcs,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p) {
+    this->io_funcs = io_funcs;
+
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx,
+    };
+
+    meta.reset(gguf_init_from_io(io_funcs, params));
+    if (!meta) {
+        throw std::runtime_error(format("%s: failed to load model from IO functions", __func__));
+    }
+
+    init_common(check_tensors, param_overrides_p, param_tensor_buft_overrides_p);
+
+    contexts.emplace_back(ctx);
+
+    // Process tensors and create weights
+    process_tensors_with_weights(ctx, SIZE_MAX, 0);
+
+    finalize_simple_loading("IO functions");
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -903,7 +1043,30 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         } else {
             memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
         }
+    } else if (buffer_data != nullptr) {
+        // Buffer-based loading
+        GGML_ASSERT(cur->data != nullptr);
+        GGML_ASSERT(w.offs + ggml_nbytes(cur) <= buffer_size);
+        memcpy(cur->data, (const uint8_t *)buffer_data + w.offs, ggml_nbytes(cur));
+    } else if (file_handle != nullptr) {
+        // File handle-based loading
+        GGML_ASSERT(cur->data != nullptr);
+        fseek(file_handle, w.offs, SEEK_SET);
+        size_t bytes_read = fread(cur->data, 1, ggml_nbytes(cur), file_handle);
+        if (bytes_read != ggml_nbytes(cur)) {
+            throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+        }
+    } else if (io_funcs.read != nullptr) {
+        // IO functions-based loading
+        GGML_ASSERT(cur->data != nullptr);
+        if (io_funcs.seek(io_funcs.user_data, w.offs) != 0) {
+            throw std::runtime_error(format("failed to seek to tensor '%s' data", ggml_get_name(cur)));
+        }
+        if (io_funcs.read(io_funcs.user_data, cur->data, ggml_nbytes(cur)) != 0) {
+            throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+        }
     } else {
+        // File-based loading
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
@@ -1058,6 +1221,83 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+            }
+        } else if (buffer_data != nullptr) {
+            // Buffer-based loading
+            if (weight->offs + n_size > this->buffer_size) {
+                LLAMA_LOG_ERROR("Buffer bounds check failed: tensor='%s', offs=%zu, size=%zu, total=%zu, buffer_size=%zu\n",
+                    ggml_get_name(cur), weight->offs, n_size, weight->offs + n_size, this->buffer_size);
+            }
+            GGML_ASSERT(weight->offs + n_size <= this->buffer_size);
+            const uint8_t * src_data = (const uint8_t *)buffer_data + weight->offs;
+
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                memcpy(cur->data, src_data, n_size);
+                if (check_tensors) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                    }));
+                }
+            } else {
+                // For GPU buffers, copy data directly
+                ggml_backend_tensor_set(cur, src_data, 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, src_data, n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+            }
+        } else if (file_handle != nullptr) {
+            // File handle-based loading
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                fseek(file_handle, weight->offs, SEEK_SET);
+                size_t bytes_read = fread(cur->data, 1, n_size, file_handle);
+                if (bytes_read != n_size) {
+                    throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+                }
+                if (check_tensors) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                    }));
+                }
+            } else {
+                // For GPU buffers, read to temporary buffer then copy
+                read_buf.resize(n_size);
+                fseek(file_handle, weight->offs, SEEK_SET);
+                size_t bytes_read = fread(read_buf.data(), 1, n_size, file_handle);
+                if (bytes_read != n_size) {
+                    throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+                }
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
+            }
+        } else if (io_funcs.read != nullptr) {
+            // IO functions-based loading
+            if (ggml_backend_buffer_is_host(cur->buffer)) {
+                if (io_funcs.seek(io_funcs.user_data, weight->offs) != 0) {
+                    throw std::runtime_error(format("failed to seek to tensor '%s' data", ggml_get_name(cur)));
+                }
+                if (io_funcs.read(io_funcs.user_data, cur->data, n_size) != 0) {
+                    throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+                }
+                if (check_tensors) {
+                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                    }));
+                }
+            } else {
+                // For GPU buffers, read to temporary buffer then copy
+                read_buf.resize(n_size);
+                if (io_funcs.seek(io_funcs.user_data, weight->offs) != 0) {
+                    throw std::runtime_error(format("failed to seek to tensor '%s' data", ggml_get_name(cur)));
+                }
+                if (io_funcs.read(io_funcs.user_data, read_buf.data(), n_size) != 0) {
+                    throw std::runtime_error(format("failed to read tensor '%s' data", ggml_get_name(cur)));
+                }
+                ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);

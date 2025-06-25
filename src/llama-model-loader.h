@@ -42,6 +42,18 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        llama_tensor_weight(size_t buffer_size, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+            const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
+            if (tensor_idx < 0) {
+                throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
+            }
+
+            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > buffer_size) {
+                throw std::runtime_error(format("tensor '%s' data is not within the buffer bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+            }
+        }
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -72,6 +84,16 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool check_tensors;
 
+    // Buffer-based loading members
+    const void * buffer_data = nullptr;
+    size_t buffer_size = 0;
+
+    // File handle-based loading members
+    FILE * file_handle = nullptr;
+
+    // IO functions-based loading members
+    struct gguf_io_functions io_funcs;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -96,6 +118,25 @@ struct llama_model_loader {
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         bool use_mmap,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    llama_model_loader(
+        const void * buffer,
+        size_t buffer_size,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    llama_model_loader(
+        FILE * file,
+        bool check_tensors,
+        const llama_model_kv_override * param_overrides_p,
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    llama_model_loader(
+        struct gguf_io_functions io_funcs,
         bool check_tensors,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
@@ -167,4 +208,17 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+private:
+    // Common initialization logic used by all constructors
+    void init_common(bool check_tensors,
+                     const llama_model_kv_override * param_overrides_p,
+                     const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    // Common tensor processing for all loading variants
+    template<typename... Args>
+    void process_tensors_with_weights(struct ggml_context * ctx, Args&&... args);
+
+    // Common final setup for non-file-based loading variants
+    void finalize_simple_loading(const char * load_type, size_t size_info = 0);
 };
